@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NovaPay.Api/NovaPay.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NovaPay.Api.Tests/NovaPay.Api.Tests.csproj" />
+  </Folder>
+</Solution>

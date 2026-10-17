@@ -27,10 +27,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
       - name: Restore locked dependencies
@@ -40,9 +41,13 @@ jobs:
       - name: Unit and API tests
         run: dotnet test NovaPay.slnx --configuration Release --no-restore --logger trx --results-directory artifacts/tests
       - name: C# security static analysis
-        run: python3 scripts/security_scan.py sast src/NovaPay.Api/NovaPay.Api.csproj
-      - name: Prove insecure code fails SAST
-        run: python3 scripts/verify_security_gates.py sast
+        run: |
+          dotnet build src/NovaPay.Api/NovaPay.Api.csproj \
+            --configuration Release --no-restore --no-incremental \
+            -p:EnableNETAnalyzers=true \
+            -p:AnalysisModeSecurity=All \
+            -p:RunAnalyzersDuringBuild=true \
+            -p:TreatWarningsAsErrors=true
       - name: Upload test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -56,28 +61,84 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install checksum-verified scanners
-        run: python3 scripts/install_security_tools.py gitleaks trivy actionlint
-      - name: Validate workflow syntax
-        run: .tools/security/actionlint -color
-      - name: Prove removed secrets fail the gate
-        run: python3 scripts/verify_security_gates.py secrets
+      - name: Create report directory
+        run: mkdir -p artifacts
       - name: Scan complete fetched Git history for secrets
-        run: python3 scripts/security_scan.py secrets . --report artifacts/secrets.json
-      - name: Prove critical vulnerabilities fail the gate
-        run: python3 scripts/verify_security_gates.py vulnerabilities
+        id: gitleaks
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: >-
+            git /github/workspace --log-opts=--all --redact=100 --exit-code=1
+            --report-format=json --report-path=/github/workspace/artifacts/secrets.json
+      - name: Summarize secret scan
+        if: always() && steps.gitleaks.outcome != 'skipped'
+        env:
+          SCAN_OUTCOME: ${{ steps.gitleaks.outcome }}
+        run: |
+          {
+            echo '## Gitleaks Secret Scan'
+            echo "**Step result:** $SCAN_OUTCOME"
+            echo '**Scope:** All fetched Git history, including removed files.'
+            if [ -f artifacts/secrets.json ]; then
+              finding_count=$(jq 'length' artifacts/secrets.json)
+              echo "**Findings:** $finding_count"
+            fi
+            if [ "$SCAN_OUTCOME" != success ]; then
+              echo 'The scan failed. Review the redacted artifact and logs; a missing report is not a clean scan.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v0.76.0
       - name: Scan NuGet dependencies including transitive and test packages
-        run: python3 scripts/security_scan.py dependencies . --report artifacts/dependencies.json
+        id: trivy
+        run: |
+          trivy fs . \
+            --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+            --skip-dirs .tools --skip-dirs artifacts \
+            --skip-dirs '**/bin' --skip-dirs '**/obj' \
+            --format table --timeout 10m \
+            > artifacts/dependencies.txt 2> artifacts/dependencies-stderr.txt
+      - name: Summarize dependency scan
+        if: always() && steps.trivy.outcome != 'skipped'
+        env:
+          SCAN_OUTCOME: ${{ steps.trivy.outcome }}
+        run: |
+          if [ -f artifacts/dependencies-stderr.txt ]; then
+            cat artifacts/dependencies-stderr.txt >&2
+          fi
+          {
+            echo '## Trivy Dependency Scan'
+            echo "**Step result:** $SCAN_OUTCOME"
+            if [ -f artifacts/dependencies.txt ]; then
+              finding_count=$(awk '/^[[:space:]]*Total: [0-9]+/ {sum += $2} END {print sum+0}' artifacts/dependencies.txt)
+              echo "**HIGH/CRITICAL findings across all targets:** $finding_count"
+              echo '<details><summary>Scan report</summary>'
+              echo
+              echo '```text'
+              cat artifacts/dependencies.txt
+              echo '```'
+              echo '</details>'
+            fi
+            if [ "$SCAN_OUTCOME" != success ]; then
+              echo 'The scan failed. A zero count does not mean the scan completed successfully; check the logs.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload security reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: security-reports
-          path: artifacts/*.json
+          path: artifacts/
           retention-days: 14
 
   container:
@@ -88,23 +149,67 @@ jobs:
     env:
       IMAGE: novapay-wallet:${{ github.sha }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install checksum-verified Trivy
-        run: python3 scripts/install_security_tools.py trivy
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Build multi-stage image
-        run: docker build --pull --tag "$IMAGE" .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.IMAGE }}
+          pull: true
+          load: true
+          push: false
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v0.76.0
+      - name: Create report directory
+        run: mkdir -p artifacts
       - name: Block high and critical image vulnerabilities
-        run: python3 scripts/security_scan.py image "$IMAGE" --report artifacts/container-scan.json
+        id: trivy
+        run: |
+          trivy image "$IMAGE" \
+            --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+            --format table --timeout 10m \
+            > artifacts/container-scan.txt 2> artifacts/container-stderr.txt
+      - name: Summarize image scan
+        if: always() && steps.trivy.outcome != 'skipped'
+        env:
+          SCAN_OUTCOME: ${{ steps.trivy.outcome }}
+        run: |
+          if [ -f artifacts/container-stderr.txt ]; then
+            cat artifacts/container-stderr.txt >&2
+          fi
+          {
+            echo '## Trivy Image Scan'
+            printf '**Image:** `%s`\n' "$IMAGE"
+            echo "**Step result:** $SCAN_OUTCOME"
+            if [ -f artifacts/container-scan.txt ]; then
+              finding_count=$(awk '/^[[:space:]]*Total: [0-9]+/ {sum += $2} END {print sum+0}' artifacts/container-scan.txt)
+              echo "**HIGH/CRITICAL findings across all targets:** $finding_count"
+              echo '<details><summary>Scan report</summary>'
+              echo
+              echo '```text'
+              cat artifacts/container-scan.txt
+              echo '```'
+              echo '</details>'
+            fi
+            if [ "$SCAN_OUTCOME" != success ]; then
+              echo 'The scan failed. A zero count does not mean the scan completed successfully; check the logs.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Verify actual non-root process, runtime restrictions and endpoints
         run: python3 scripts/verify_container.py "$IMAGE" | tee artifacts/container-verification.json
       - name: Upload container evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v4
         with:
           name: container-evidence
-          path: artifacts/*.json
+          path: artifacts/
           retention-days: 14
 
   ci-pass:

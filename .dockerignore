@@ -1,0 +1,8 @@
+**
+!src/
+!src/**
+src/**/bin/
+src/**/obj/
+!Directory.Build.props
+!global.json
+!NuGet.Config

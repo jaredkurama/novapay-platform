@@ -71,7 +71,8 @@ public sealed class ApiTests
     public void ProductionCannotStartWithDemoStore()
     {
         using var factory = new WebApplicationFactory<Program>()
-            .WithWebHostBuilder(builder => builder.UseEnvironment("Production"));
+            .WithWebHostBuilder(builder => builder.UseEnvironment("Production")
+                .UseSetting("WalletStore:Provider", "Demo"));
         var exception = Assert.Throws<InvalidOperationException>(() => factory.CreateClient());
         Assert.Contains("demo store", exception.Message);
     }

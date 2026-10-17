@@ -1,4 +1,5 @@
 using NovaPay.Api;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
@@ -7,12 +8,26 @@ builder.Logging.AddJsonConsole(options => options.IncludeScopes = false);
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.WebHost.ConfigureKestrel(options => options.AddServerHeader = false);
 builder.Services.AddSingleton<RequestMetrics>();
-builder.Services.AddSingleton<IWalletStore, DemoWalletStore>();
-
-// Explicitly refuse an accidental production deployment backed by in-memory demo data.
-if (!builder.Environment.IsDevelopment() && !builder.Environment.IsEnvironment("Testing"))
+var provider = builder.Configuration["WalletStore:Provider"]
+    ?? (builder.Environment.IsEnvironment("Testing") ? "Demo" : "Postgres");
+if (provider.Equals("Demo", StringComparison.OrdinalIgnoreCase))
 {
-    throw new InvalidOperationException("The demo store is restricted to Development/Testing. Configure the persistent store before deploying.");
+    if (!builder.Environment.IsDevelopment() && !builder.Environment.IsEnvironment("Testing"))
+    {
+        throw new InvalidOperationException("The demo store is restricted to Development/Testing.");
+    }
+    builder.Services.AddSingleton<IWalletStore, DemoWalletStore>();
+}
+else if (provider.Equals("Postgres", StringComparison.OrdinalIgnoreCase))
+{
+    var settings = PostgresConfiguration.Read(builder.Configuration,
+        builder.Environment.IsDevelopment() || builder.Environment.IsEnvironment("Testing"));
+    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(settings.ConnectionString));
+    builder.Services.AddSingleton<IWalletStore, PostgresWalletStore>();
+}
+else
+{
+    throw new InvalidOperationException("WalletStore:Provider must be Postgres or Demo.");
 }
 
 var app = builder.Build();

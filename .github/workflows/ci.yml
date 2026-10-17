@@ -202,7 +202,7 @@ jobs:
               echo 'The scan failed. A zero count does not mean the scan completed successfully; check the logs.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Verify actual non-root process, runtime restrictions and endpoints
+      - name: Verify PostgreSQL integration, non-root process and endpoints
         run: python3 scripts/verify_container.py "$IMAGE" | tee artifacts/container-verification.json
       - name: Upload container evidence
         if: always()

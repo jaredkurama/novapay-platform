@@ -1,0 +1,61 @@
+services:
+  wallet:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      APP_VERSION: local
+      WalletStore__Provider: Postgres
+      Database__Host: postgres
+      Database__Name: novapay
+      Database__Username: novapay_app
+      Database__PasswordFile: /run/secrets/postgres_app_password
+      Database__SslMode: Disable
+    secrets:
+      - postgres_app_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: novapay
+      POSTGRES_USER: novapay_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_admin_password
+      - postgres_app_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/local-init.sh:/docker-entrypoint-initdb.d/001-init.sh:ro
+      - ./database/schema.sql:/opt/novapay/schema.sql:ro
+      - ./database/seed-demo.sql:/opt/novapay/seed-demo.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U novapay_admin -d novapay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+
+volumes:
+  postgres-data:
+
+secrets:
+  postgres_admin_password:
+    file: ${NOVAPAY_SECRETS_DIR:?Set NOVAPAY_SECRETS_DIR to a directory outside this repository}/admin-password
+  postgres_app_password:
+    file: ${NOVAPAY_SECRETS_DIR:?Set NOVAPAY_SECRETS_DIR to a directory outside this repository}/app-password

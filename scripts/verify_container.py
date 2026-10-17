@@ -1,9 +1,14 @@
 """Verify a locally built image using Docker and Python 3 (no third-party packages)."""
 
 import json
+import atexit
+import pathlib
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 
 
@@ -17,15 +22,67 @@ def require(condition, message):
 
 
 image = sys.argv[1] if len(sys.argv) > 1 else "novapay-wallet:local"
+resources = []
+temporary = tempfile.TemporaryDirectory(prefix="novapay-check-")
+
+
+def cleanup():
+    for resource in reversed(resources):
+        subprocess.run(["docker", *resource], check=False, stdout=subprocess.DEVNULL)
+    temporary.cleanup()
+
+
+atexit.register(cleanup)
+secret_dir = pathlib.Path(temporary.name)
+for name in ("admin-password", "app-password"):
+    path = secret_dir / name
+    path.write_text(secrets.token_hex(32), encoding="utf-8")
+    path.chmod(0o444)
+network = docker("network", "create", "novapay-check-" + secrets.token_hex(6))
+resources.append(("network", "rm", network))
+database_dir = pathlib.Path(__file__).resolve().parent.parent / "database"
+db = docker(
+    "run", "--detach", "--network", network, "--network-alias", "postgres",
+    "--env", "POSTGRES_DB=novapay", "--env", "POSTGRES_USER=novapay_admin",
+    "--env", "POSTGRES_PASSWORD_FILE=/run/secrets/postgres_admin_password",
+    "--mount", f"type=bind,src={secret_dir / 'admin-password'},dst=/run/secrets/postgres_admin_password,readonly",
+    "--mount", f"type=bind,src={secret_dir / 'app-password'},dst=/run/secrets/postgres_app_password,readonly",
+    "--mount", f"type=bind,src={database_dir / 'local-init.sh'},dst=/docker-entrypoint-initdb.d/001-init.sh,readonly",
+    "--mount", f"type=bind,src={database_dir / 'schema.sql'},dst=/opt/novapay/schema.sql,readonly",
+    "--mount", f"type=bind,src={database_dir / 'seed-demo.sql'},dst=/opt/novapay/seed-demo.sql,readonly",
+    "postgres:17-alpine",
+)
+resources.append(("rm", "--force", "--volumes", db))
+
+
+def wait_database():
+    for attempt in range(60):
+        result = subprocess.run(
+            ["docker", "exec", db, "pg_isready", "-h", "127.0.0.1", "-U", "novapay_admin", "-d", "novapay"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if result.returncode == 0:
+            return
+        time.sleep(1)
+    raise RuntimeError("PostgreSQL did not become ready")
+
+
+wait_database()
 container = docker(
     "run", "--detach", "--read-only", "--cap-drop=ALL",
     "--security-opt=no-new-privileges:true",
     "--tmpfs", "/tmp:size=32m,mode=1777", "--memory=256m",
     "--cpus=0.5", "--pids-limit=128",
     "--publish", "127.0.0.1::8080",
+    "--network", network,
     "--env", "ASPNETCORE_ENVIRONMENT=Development",
+    "--env", "WalletStore__Provider=Postgres",
+    "--env", "Database__Host=postgres", "--env", "Database__Name=novapay",
+    "--env", "Database__Username=novapay_app", "--env", "Database__SslMode=Disable",
+    "--env", "Database__PasswordFile=/run/secrets/postgres_app_password",
+    "--mount", f"type=bind,src={secret_dir / 'app-password'},dst=/run/secrets/postgres_app_password,readonly",
     "--env", "APP_VERSION=container-verification", image,
 )
+resources.append(("rm", "--force", container))
 
 try:
     details = json.loads(docker("inspect", container))[0]
@@ -41,7 +98,7 @@ try:
     http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def get(path):
-        with http.open(base + path, timeout=2) as response:
+        with http.open(base + path, timeout=6) as response:
             require(response.status == 200, "Unexpected HTTP status")
             return response.read().decode()
 
@@ -64,6 +121,32 @@ try:
     require('route="/wallets/{id}",status="200"} 1' in metrics, "Wallet metric missing")
     require("demo-wallet" not in metrics, "Wallet identifier leaked into metrics")
 
+    docker("exec", db, "psql", "-U", "novapay_admin", "-d", "novapay", "-v", "ON_ERROR_STOP=1",
+           "-c", "UPDATE public.wallets SET balance_kobo = 250000 WHERE wallet_id = 'demo-wallet'")
+    require(json.loads(get("/wallets/demo-wallet"))["balanceKobo"] == 250000,
+            "API did not read the updated PostgreSQL balance")
+    denied = subprocess.run(
+        ["docker", "exec", db, "psql", "-U", "novapay_admin", "-d", "novapay", "-v", "ON_ERROR_STOP=1",
+         "-c", "SET ROLE novapay_app; UPDATE public.wallets SET balance_kobo = 0"],
+        capture_output=True, text=True, check=False)
+    require(denied.returncode != 0 and "permission denied" in denied.stderr,
+            "Application role can modify wallets")
+    docker("stop", db)
+    for path, status, body in (("/ready", 503, {"status": "not_ready"}),
+                               ("/wallets/demo-wallet", 500, {"error": "internal_error"})):
+        try:
+            get(path)
+            raise RuntimeError("Database outage was not detected")
+        except urllib.error.HTTPError as error:
+            require(error.code == status and json.loads(error.read()) == body,
+                    "Unexpected database outage response")
+    require(json.loads(get("/health"))["status"] == "healthy", "Outage broke liveness")
+    docker("start", db)
+    wait_database()
+    require(json.loads(get("/ready"))["status"] == "ready", "Readiness did not recover")
+    require(json.loads(get("/wallets/demo-wallet"))["balanceKobo"] == 250000,
+            "Balance did not persist across database restart")
+
     # The chiseled image has no shell/id executable. Inspect the real process via Docker.
     processes = docker("top", container, "-eo", "uid,pid,args").splitlines()
     require(len(processes) > 1, "No running application process")
@@ -84,8 +167,10 @@ try:
         "capabilities_dropped": "ALL",
         "no_new_privileges": True,
         "binding": "loopback only",
-        "checks": ["health", "readiness", "version", "integer kobo", "metrics", "JSON logs"],
+        "checks": ["health", "readiness", "version", "integer kobo", "metrics", "JSON logs",
+                   "PostgreSQL lookup", "read-only DB role", "database outage", "restart persistence"],
     }, indent=2))
 finally:
     # Remove only the temporary container created by this script; preserve the image.
-    docker("rm", "--force", container)
+    cleanup()
+    atexit.unregister(cleanup)

@@ -8,7 +8,7 @@ public interface IWalletStore
     Task<bool> IsReadyAsync(CancellationToken cancellationToken);
 }
 
-// Synthetic data only; the deployed service will use a separate datastore adapter.
+// Explicit opt-in for development and tests only; PostgreSQL is the runtime default.
 public sealed class DemoWalletStore : IWalletStore
 {
     public Task<Wallet?> GetAsync(string id, CancellationToken cancellationToken) =>

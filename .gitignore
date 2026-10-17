@@ -19,3 +19,4 @@ crash.log
 artifacts/
 .aws/
 .codex/
+**/__pycache__/

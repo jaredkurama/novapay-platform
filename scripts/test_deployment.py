@@ -106,7 +106,7 @@ def run_case(mode, existing):
         sleep.write_text("#!/bin/sh\nexit 0\n")
         sleep.chmod(0o755)
         script = (root / "infra/staging/deploy-staging.sh.tftpl").read_text()
-        for key, value in {"repository": "registry.example/novapay-wallet", "secret_arn": "synthetic-secret-id", "db_host": "database.example"}.items():
+        for key, value in {"repository": "registry.example/novapay-wallet", "secret_arn": "synthetic-secret-id", "db_host": "database.example", "log_group": "/synthetic/wallet"}.items():
             script = script.replace("${" + key + "}", value)
         script = script.replace("/var/lib/novapay/releases", str(releases)).replace("/run/lock/novapay-deploy.lock", str(directory / "deploy.lock"))
         script_path = directory / "deploy.sh"

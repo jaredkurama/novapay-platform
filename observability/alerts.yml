@@ -1,0 +1,22 @@
+groups:
+  - name: novapay-wallet
+    rules:
+      - alert: NovaPayHighErrorRate
+        expr: |
+          (sum by (job) (rate(novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}",status=~"5.."}[5m]))
+          / clamp_min(sum by (job) (rate(novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}"}[5m])), 0.001) > 0.05)
+          and sum by (job) (increase(novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NovaPay error rate exceeds 5% for five minutes"
+          description: "At least 20 requests occurred in the rolling five-minute window. Check deployment health and datastore access."
+      - alert: NovaPayScrapeFailed
+        expr: up{job="novapay-wallet"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NovaPay metrics scrape has failed for two minutes"
+          description: "Check the API container and the monitoring network path. This alert does not independently test database readiness."

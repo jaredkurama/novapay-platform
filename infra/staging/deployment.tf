@@ -52,6 +52,7 @@ resource "aws_ssm_document" "deploy" {
           repository = aws_ecr_repository.wallet.repository_url
           secret_arn = aws_secretsmanager_secret.application_database.arn
           db_host    = aws_db_instance.wallet.address
+          log_group  = aws_cloudwatch_log_group.wallet.name
         })]
       }
     }]

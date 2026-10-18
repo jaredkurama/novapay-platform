@@ -7,6 +7,7 @@ umask 077
 repository='${repository}'
 secret_arn='${secret_arn}'
 db_host='${db_host}'
+log_group='${log_group}'
 region='eu-west-1'
 digest="$SSM_ImageDigest"
 version="$SSM_AppVersion"
@@ -95,6 +96,11 @@ docker pull "$image"
 run_wallet() {
   docker run --detach --name "$1" --publish "127.0.0.1:$2:8080" \
     --label novapay.managed=true --label "novapay.release=$release" \
+    --log-driver awslogs --log-opt "awslogs-region=$region" \
+    --log-opt "awslogs-group=$log_group" --log-opt awslogs-create-group=false \
+    --log-opt "awslogs-stream=$version/$(basename "$release")/$1" \
+    --log-opt mode=non-blocking --log-opt max-buffer-size=4m \
+    --log-opt cache-max-size=10m --log-opt cache-max-file=3 \
     --read-only --user 1654:1654 --cap-drop=ALL --security-opt=no-new-privileges:true \
     --tmpfs /tmp:size=32m,mode=1777 --memory=256m --cpus=0.5 --pids-limit=128 \
     --env ASPNETCORE_ENVIRONMENT=Staging --env "APP_VERSION=$version" \

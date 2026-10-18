@@ -39,6 +39,13 @@ resource "aws_iam_role_policy" "instance" {
         Resource = aws_ecr_repository.wallet.arn
       },
       {
+        Sid    = "WriteApplicationLogs"
+        Effect = "Allow"
+        Action = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        # Each deployment has unique streams; access stays inside this one group.
+        Resource = "${aws_cloudwatch_log_group.wallet.arn}:log-stream:*"
+      },
+      {
         Sid      = "ReadApplicationDatabaseSecret"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]

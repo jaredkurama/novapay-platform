@@ -40,6 +40,14 @@ jobs:
         run: dotnet format NovaPay.slnx --no-restore --verify-no-changes
       - name: Unit and API tests
         run: dotnet test NovaPay.slnx --configuration Release --no-restore --logger trx --results-directory artifacts/tests
+      - name: Validate monitoring configuration and alert behavior
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/observability:/etc/prometheus:ro" prom/prometheus:v3.15.0 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/observability:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.15.0 \
+            test rules alerts.test.yml
       - name: C# security static analysis
         run: |
           dotnet build NovaPay.slnx \

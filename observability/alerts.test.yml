@@ -1,0 +1,68 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: Sustained wallet failures fire despite successful health traffic
+    interval: 1m
+    input_series:
+      - series: 'novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}",status="200"}'
+        values: '0+90x15'
+      - series: 'novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}",status="500"}'
+        values: '0+10x15'
+      - series: 'novapay_http_requests_total{job="novapay-wallet",route="/health",status="200"}'
+        values: '0+10000x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NovaPayHighErrorRate
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: NovaPayHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              job: novapay-wallet
+              severity: warning
+            exp_annotations:
+              summary: "NovaPay error rate exceeds 5% for five minutes"
+              description: "At least 20 requests occurred in the rolling five-minute window. Check deployment health and datastore access."
+  - name: Low traffic does not page on a single failed request
+    interval: 1m
+    input_series:
+      - series: 'novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}",status="500"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NovaPayHighErrorRate
+        exp_alerts: []
+  - name: Healthy traffic and unrelated service errors do not trigger wallet alert
+    interval: 1m
+    input_series:
+      - series: 'novapay_http_requests_total{job="novapay-wallet",route="/wallets/{id}",status="200"}'
+        values: '0+100x15'
+      - series: 'novapay_http_requests_total{job="other-service",route="/wallets/{id}",status="500"}'
+        values: '0+100x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NovaPayHighErrorRate
+        exp_alerts: []
+  - name: Failed scrapes alert after two minutes and resolve on recovery
+    interval: 1m
+    input_series:
+      - series: 'up{job="novapay-wallet",instance="wallet:8080"}'
+        values: '1 0 0 0 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: NovaPayScrapeFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: NovaPayScrapeFailed
+        exp_alerts:
+          - exp_labels:
+              job: novapay-wallet
+              instance: wallet:8080
+              severity: critical
+            exp_annotations:
+              summary: "NovaPay metrics scrape has failed for two minutes"
+              description: "Check the API container and the monitoring network path. This alert does not independently test database readiness."
+      - eval_time: 4m
+        alertname: NovaPayScrapeFailed
+        exp_alerts: []

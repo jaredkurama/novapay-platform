@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -42,7 +42,7 @@ jobs:
         run: dotnet test NovaPay.slnx --configuration Release --no-restore --logger trx --results-directory artifacts/tests
       - name: C# security static analysis
         run: |
-          dotnet build src/NovaPay.Api/NovaPay.Api.csproj \
+          dotnet build NovaPay.slnx \
             --configuration Release --no-restore --no-incremental \
             -p:EnableNETAnalyzers=true \
             -p:AnalysisModeSecurity=All \
@@ -145,13 +145,20 @@ jobs:
     name: Build, scan and verify container
     needs: [quality, security]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
     env:
       IMAGE: novapay-wallet:${{ github.sha }}
+      AWS_REGION: eu-west-1
+      STAGING_INSTANCE_ID: i-0f497102e8d5a3051
+      DEPLOY_DOCUMENT: novapay-staging-deploy
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build multi-stage image
@@ -163,10 +170,12 @@ jobs:
           pull: true
           load: true
           push: false
+
       - name: Set up Trivy
         uses: aquasecurity/setup-trivy@v0.3.1
         with:
           version: v0.76.0
+
       - name: Create report directory
         run: mkdir -p artifacts
       - name: Block high and critical image vulnerabilities
@@ -202,8 +211,81 @@ jobs:
               echo 'The scan failed. A zero count does not mean the scan completed successfully; check the logs.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Verify PostgreSQL integration, non-root process and endpoints
+      - name: Verify actual non-root process, runtime restrictions and endpoints
         run: python3 scripts/verify_container.py "$IMAGE" | tee artifacts/container-verification.json
+      - name: Test deployment readiness and rollback paths without AWS access
+        run: python3 scripts/test_deployment.py
+      - name: Obtain temporary AWS credentials through GitHub OIDC
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::008971632699:role/novapay-staging-github-deployment
+          role-session-name: novapay-${{ github.run_id }}
+          allowed-account-ids: "008971632699"
+      - name: Log in to private ECR
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Publish the scanned image and resolve its immutable digest
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        id: publish
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          repository="$REGISTRY/novapay-wallet"
+          docker tag "$IMAGE" "$repository:$tag"
+          docker push "$repository:$tag"
+          digest=$(aws ecr describe-images --repository-name novapay-wallet \
+            --image-ids "imageTag=$tag" --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker inspect "$repository:$tag" --format '{{json .RepoDigests}}' |
+            jq -e --arg expected "$repository@$digest" 'index($expected) != null' >/dev/null
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          printf '## Published image\n`%s@%s`\n' "$repository" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Deploy the digest through the restricted SSM document
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        id: deploy
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          command_id=$(aws ssm send-command \
+            --instance-ids "$STAGING_INSTANCE_ID" \
+            --document-name "$DEPLOY_DOCUMENT" \
+            --parameters "ImageDigest=$IMAGE_DIGEST,AppVersion=$GITHUB_SHA" \
+            --timeout-seconds 120 \
+            --comment "NovaPay deployment $GITHUB_SHA" \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$command_id" >> "$GITHUB_OUTPUT"
+      - name: Wait for readiness or rollback and report the deployment result
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
+        run: |
+          for attempt in $(seq 1 180); do
+            if aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+              --instance-id "$STAGING_INSTANCE_ID" > artifacts/deployment.json 2> artifacts/deployment-stderr.txt; then
+              status=$(jq -r '.Status' artifacts/deployment.json)
+              case "$status" in
+                Success)
+                  jq -r '.StandardOutputContent' artifacts/deployment.json
+                  printf '## Staging deployment\nReadiness passed for `%s`.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0 ;;
+                Pending|InProgress|Delayed) ;;
+                *)
+                  jq -r '.StandardOutputContent, .StandardErrorContent' artifacts/deployment.json
+                  printf '## Staging deployment\nFailed: %s. Review rollback output in the deployment artifact.\n' "$status" >> "$GITHUB_STEP_SUMMARY"
+                  exit 1 ;;
+              esac
+            elif ! grep -q InvocationDoesNotExist artifacts/deployment-stderr.txt; then
+              cat artifacts/deployment-stderr.txt >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for SSM command $COMMAND_ID; inspect its status before retrying." >&2
+          exit 1
       - name: Upload container evidence
         if: always()
         uses: actions/upload-artifact@v4

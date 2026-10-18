@@ -1,0 +1,136 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+# Terraform renders only trusted resource identifiers. SSM inputs are validated
+# parameters delivered through environment variables, never shell interpolation.
+repository='${repository}'
+secret_arn='${secret_arn}'
+db_host='${db_host}'
+region='eu-west-1'
+digest="$SSM_ImageDigest"
+version="$SSM_AppVersion"
+[[ "$digest" =~ ^sha256:[a-f0-9]{64}$ && "$version" =~ ^[a-f0-9]{40}$ ]]
+image="$repository@$digest"
+registry=$(printf '%s' "$repository" | cut -d/ -f1)
+
+exec 9>/run/lock/novapay-deploy.lock
+flock -w 120 9
+command -v jq >/dev/null || dnf install -y jq
+# Encrypted EBS holds these root-only release directories across host reboots.
+install -d -m 0700 /var/lib/novapay/releases
+release=$(mktemp -d /var/lib/novapay/releases/release.XXXXXXXX)
+export DOCKER_CONFIG="$release/docker-auth"
+mkdir -m 0700 "$DOCKER_CONFIG"
+candidate='novapay-candidate'
+active='novapay-wallet'
+previous='novapay-previous'
+switched=0
+success=0
+previous_exists=0
+
+for name in "$candidate" "$active" "$previous"; do
+  if docker inspect "$name" >/dev/null 2>&1; then
+    [ "$(docker inspect --format '{{index .Config.Labels "novapay.managed"}}' "$name")" = true ] || {
+      echo "Refusing to replace unmanaged container: $name" >&2
+      exit 1
+    }
+  fi
+done
+
+ready() {
+  local port="$1"
+  local expected_version="$2"
+  for attempt in $(seq 1 30); do
+    if curl --silent --fail --max-time 4 "http://127.0.0.1:$port/ready" | jq -e '.status == "ready"' >/dev/null &&
+       curl --silent --fail --max-time 4 "http://127.0.0.1:$port/version" | jq -e --arg version "$expected_version" '.version == $version' >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+cleanup() {
+  local code=$?
+  trap - EXIT
+  docker rm -f "$candidate" >/dev/null 2>&1 || true
+  rm -rf -- "$DOCKER_CONFIG"
+  rm -f -- "$release/secret.json"
+  if [ "$success" = 0 ] && [ "$switched" = 1 ]; then
+    docker rm -f "$active" >/dev/null 2>&1 || true
+    if [ "$previous_exists" = 1 ]; then
+      if docker rename "$previous" "$active" && docker start "$active" >/dev/null && ready 8080 "$old_version"; then
+        echo 'Deployment failed; previous container restored and ready.'
+      else
+        echo 'Deployment failed and rollback needs operator attention.' >&2
+      fi
+    else
+      echo 'First deployment failed; no previous release exists.' >&2
+    fi
+  fi
+  # Successful/previous containers need their mounted files. Failed releases do not.
+  if [ "$success" = 0 ]; then rm -rf -- "$release"; fi
+  exit "$code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+aws secretsmanager get-secret-value --secret-id "$secret_arn" --region "$region" > "$release/secret.json"
+jq -e --arg host "$db_host" '
+  (.VersionStages | index("AWSCURRENT") != null) and
+  (.VersionStages | index("AWSPENDING") == null) and
+  (.SecretString | fromjson | .host == $host and .port == 5432 and
+    .dbname == "novapay" and .username == "novapay_app" and .engine == "postgres")
+' "$release/secret.json" >/dev/null 2>/dev/null
+jq -er '.SecretString | fromjson | .password | select(type == "string" and length > 0)' "$release/secret.json" > "$release/password" 2>/dev/null
+rm -f -- "$release/secret.json"
+curl --fail --silent --show-error --max-time 30 \
+  "https://truststore.pki.rds.amazonaws.com/$region/$region-bundle.pem" -o "$release/rds-ca.pem"
+chmod 0444 "$release/password" "$release/rds-ca.pem"
+aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
+docker pull "$image"
+
+run_wallet() {
+  docker run --detach --name "$1" --publish "127.0.0.1:$2:8080" \
+    --label novapay.managed=true --label "novapay.release=$release" \
+    --read-only --user 1654:1654 --cap-drop=ALL --security-opt=no-new-privileges:true \
+    --tmpfs /tmp:size=32m,mode=1777 --memory=256m --cpus=0.5 --pids-limit=128 \
+    --env ASPNETCORE_ENVIRONMENT=Staging --env "APP_VERSION=$version" \
+    --env WalletStore__Provider=Postgres --env "Database__Host=$db_host" \
+    --env Database__Name=novapay --env Database__Username=novapay_app \
+    --env Database__SslMode=VerifyFull --env Database__RootCertificate=/run/secrets/rds-ca.pem \
+    --env Database__PasswordFile=/run/secrets/database-password \
+    --mount "type=bind,src=$release/password,dst=/run/secrets/database-password,readonly" \
+    --mount "type=bind,src=$release/rds-ca.pem,dst=/run/secrets/rds-ca.pem,readonly" \
+    "$image" >/dev/null
+}
+
+docker rm -f "$candidate" >/dev/null 2>&1 || true
+run_wallet "$candidate" ''
+candidate_port=$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' "$candidate")
+ready "$candidate_port" "$version"
+docker rm -f "$candidate" >/dev/null
+
+if docker inspect "$active" >/dev/null 2>&1; then
+  old_version=$(docker inspect --format '{{json .Config.Env}}' "$active" | jq -er '.[] | select(startswith("APP_VERSION=")) | sub("^APP_VERSION="; "")')
+  if docker inspect "$previous" >/dev/null 2>&1; then
+    obsolete=$(docker inspect --format '{{index .Config.Labels "novapay.release"}}' "$previous")
+    docker rm -f "$previous" >/dev/null
+    case "$obsolete" in
+      /var/lib/novapay/releases/release.*) rm -rf -- "$obsolete" ;;
+    esac
+  fi
+  docker rename "$active" "$previous"
+  previous_exists=1
+  switched=1
+  docker stop --time 20 "$previous" >/dev/null
+else
+  switched=1
+fi
+run_wallet "$active" 8080
+ready 8080 "$version"
+docker update --restart unless-stopped "$active" >/dev/null
+success=1
+echo "Deployment ready: $image; version $version; bound to 127.0.0.1:8080."

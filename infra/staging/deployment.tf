@@ -15,7 +15,8 @@ resource "aws_iam_role" "github_deployment" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:jaredkurama/novapay-platform:ref:refs/heads/master"
+          # Immutable owner/repository IDs from the failed run's CloudTrail identity.
+          "token.actions.githubusercontent.com:sub" = "repo:jaredkurama@137181595/novapay-platform@1423430941:ref:refs/heads/master"
         }
       }
     }]

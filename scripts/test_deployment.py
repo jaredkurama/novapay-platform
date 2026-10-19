@@ -78,8 +78,44 @@ def mock(command, args):
             raise AssertionError("Unexpected Docker operation: " + operation)
     else:
         raise AssertionError("Unexpected mock command")
-    path.write_text(json.dumps(state))
+    # Shell pipelines run concurrently (AWS token output | Docker login).
+    # Read-only mocks must not truncate/rewrite their shared state file.
+    # Mutating Docker commands in the deployment script run sequentially.
+    if command == "docker" and args[0] in ("run", "rm", "rename", "start", "stop"):
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state))
+        temporary.replace(path)
     return result
+
+
+def test_read_only_mocks():
+    """Prevent the concurrent login pipeline from ever writing shared state."""
+    # Only the parent test runner needs these; mocks launch many short processes.
+    import io
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory(prefix="novapay-mock-state-") as directory:
+        path = Path(directory) / "state.json"
+        original = json.dumps({"mode": "success", "containers": {"wallet": {
+            "running": True, "port": "8080", "version": "test", "release": "test"
+        }}})
+        path.write_text(original)
+        with patch.dict(os.environ, DEPLOY_TEST_STATE=str(path)), \
+             patch.object(Path, "write_text", side_effect=AssertionError("Read-only mock wrote a file")), \
+             patch.object(sys, "stdin", io.StringIO("synthetic-token")), redirect_stdout(io.StringIO()):
+            for command, args in [
+                ("aws", ["ecr", "get-login-password"]),
+                ("docker", ["login", "registry.example"]),
+                ("aws", ["secretsmanager", "get-secret-value"]),
+                ("docker", ["inspect", "wallet"]),
+                ("docker", ["pull", "synthetic-image"]),
+                ("docker", ["update", "wallet"]),
+                ("curl", ["http://127.0.0.1:8080/ready"]),
+            ]:
+                assert mock(command, args) == 0
+        assert path.read_text() == original
+    print("Passed: read-only mocks never rewrite shared state")
 
 
 def run_case(mode, existing):
@@ -140,6 +176,7 @@ def run_case(mode, existing):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--mock":
         sys.exit(mock(sys.argv[2], sys.argv[3:]))
+    test_read_only_mocks()
     for mode, existing in [("success", False), ("success", True), ("candidate-failure", True),
                            ("replacement-failure", True), ("replacement-failure", False), ("pending-secret", True)]:
         run_case(mode, existing)

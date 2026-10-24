@@ -3,7 +3,7 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="AWSSDK.SecretsManager" Version="4.0.100.19" />
+    <PackageReference Include="AWSSDK.SecretsManager" Version="4.0.100.21" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 </Project>
